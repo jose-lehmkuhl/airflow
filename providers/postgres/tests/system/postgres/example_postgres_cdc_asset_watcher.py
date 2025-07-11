@@ -42,6 +42,9 @@ This DAG sets up an AssetWatcher linked to a PostgreSQL CDC trigger, which monit
 in a specific table based on a timestamp column (`cdc_column`). When a change is detected, it executes a task
 that processes new rows and updates the Airflow Variable used to track CDC state (`state_key`).
 
+**Important**: The state Variable must be explicitly initialized before using the trigger to prevent
+recursive DAG executions. This example shows how to do this properly.
+
 The state variable is configurable via `state_key`.
 """
 
@@ -70,6 +73,25 @@ with DAG(
 ) as dag:
 
     @task
+    def initialize_cdc_state():
+        """
+        Initialize the CDC state Variable if it doesn't exist.
+        This prevents recursive DAG executions by ensuring the Variable is set before the trigger runs.
+        """
+        try:
+            current_value = Variable.get(STATE_KEY, default=None)
+            if current_value is None:
+                # Initialize with a timestamp before any expected data
+                initial_timestamp = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+                Variable.set(STATE_KEY, initial_timestamp.isoformat())
+                print(f"Initialized {STATE_KEY} with: {initial_timestamp.isoformat()}")
+            else:
+                print(f"CDC state Variable {STATE_KEY} already exists with value: {current_value}")
+        except Exception as e:
+            print(f"Error initializing CDC state: {e}")
+            raise
+
+    @task
     def extract_and_update_last_value():
         """
         Extracts new rows from the monitored table that have `updated_at` greater than the
@@ -85,7 +107,8 @@ with DAG(
                 if last_value:
                     last_dt = datetime.fromisoformat(last_value)
                 else:
-                    last_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                    # This should not happen if initialize_cdc_state ran properly
+                    raise ValueError(f"CDC state Variable {STATE_KEY} not found. Please run initialize_cdc_state task first.")
 
                 query = "SELECT updated_at, id, data FROM my_table WHERE updated_at > %s"
                 cursor.execute(query, (last_dt,))
@@ -101,7 +124,8 @@ with DAG(
                 else:
                     print("No new updates found.")
 
-    extract_and_update_last_value()
+    # Initialize state before processing
+    initialize_cdc_state() >> extract_and_update_last_value()
 # [END howto_operator_postgres_cdc_watcher]
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402

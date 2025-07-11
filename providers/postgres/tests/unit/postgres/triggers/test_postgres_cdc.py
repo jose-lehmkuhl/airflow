@@ -47,6 +47,8 @@ class TestPostgresCDCEventTrigger:
     - Trigger behavior when new changes are detected.
     - Correct handling when no new changes are present.
     - Proper exception handling on connection failures.
+    - Guard behavior when state Variable is not initialized.
+    - Proper handling when state Variable is removed during polling.
     """
 
     def setup_method(self):
@@ -81,6 +83,31 @@ class TestPostgresCDCEventTrigger:
             "polling_interval": 30,
             "state_key": "custom_cdc_state",
         }
+
+    def test_default_state_key(self):
+        """Test that default state key is generated correctly."""
+        trigger = PostgresCDCEventTrigger(
+            conn_id="postgres_default",
+            table="my_table",
+            cdc_column="updated_at",
+        )
+        assert trigger.state_key == "my_table_cdc_last_value"
+
+    @pytest.mark.asyncio
+    async def test_trigger_run_without_state_variable(self):
+        """Test that trigger logs warning and skips event emission when state Variable doesn't exist."""
+        trigger = PostgresCDCEventTrigger(
+            conn_id="postgres_default",
+            table="my_table",
+            cdc_column="updated_at",
+            polling_interval=0.1,
+            state_key="custom_cdc_state",
+        )
+
+        with patch("airflow.sdk.Variable.get", return_value=None):
+            # The trigger should return early without yielding any events
+            with pytest.raises(StopAsyncIteration):
+                await trigger.run().__anext__()
 
     @pytest.mark.asyncio
     async def test_trigger_run_with_change(self):
@@ -136,6 +163,33 @@ class TestPostgresCDCEventTrigger:
                 await asyncio.wait_for(task, timeout=1)
 
     @pytest.mark.asyncio
+    async def test_trigger_run_state_variable_removed_during_polling(self):
+        """Test that trigger handles state Variable being removed during polling."""
+        trigger = PostgresCDCEventTrigger(
+            conn_id="postgres_default",
+            table="my_table",
+            cdc_column="updated_at",
+            polling_interval=0.1,
+            state_key="custom_cdc_state",
+        )
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc),)
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_conn.__enter__.return_value = mock_conn
+
+        # First call returns a value, second call returns None (Variable removed)
+        with (
+            patch("airflow.providers.postgres.hooks.postgres.PostgresHook.get_conn", return_value=mock_conn),
+            patch("airflow.sdk.Variable.get", side_effect=["2024-01-01T00:00:00", None]),
+        ):
+            # The trigger should return early without yielding any events
+            with pytest.raises(StopAsyncIteration):
+                await trigger.run().__anext__()
+
+    @pytest.mark.asyncio
     async def test_trigger_run_exception(self, mocker):
         trigger = PostgresCDCEventTrigger(
             conn_id="postgres_default",
@@ -149,6 +203,9 @@ class TestPostgresCDCEventTrigger:
             "airflow.providers.postgres.hooks.postgres.PostgresHook.get_conn",
             side_effect=Exception("Connection failed"),
         )
+
+        # Mock Variable.get to return a value so the guard doesn't trigger
+        mocker.patch("airflow.sdk.Variable.get", return_value="2024-01-01T00:00:00")
 
         task = asyncio.create_task(trigger.run().__anext__())
         with pytest.raises(asyncio.TimeoutError):

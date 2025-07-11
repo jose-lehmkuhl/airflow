@@ -39,10 +39,47 @@ class PostgresCDCEventTrigger(BaseEventTrigger):
     A trigger that waits for changes in a PostgreSQL table using polling over a timestamp/version column.
 
     The behavior of this trigger is as follows:
+    - Check if the state Variable exists. If not, log a warning and skip event emission to prevent
+      recursive DAG executions.
     - Poll the target table using `SELECT MAX(cdc_column)`.
     - Compare the result with the stored "last read" value (persisted as an Airflow Variable).
     - If a new value is found (greater than last read), emit a TriggerEvent containing metadata.
     - If no new value is found, sleep for `polling_interval` seconds and continue polling.
+
+    **Important**: The state Variable must be created before using this trigger (via UI, CLI, or code).
+    Your DAG must also update this Variable after processing changes to prevent reprocessing the same data.
+    If the Variable is not found, the trigger will log a warning and skip event emission to avoid
+    recursive DAG executions.
+
+    Example usage:
+        .. code-block:: python
+
+            from airflow.sdk import Variable
+            from airflow.providers.postgres.triggers.postgres_cdc import PostgresCDCEventTrigger
+
+            # Create the state Variable (do this once, via UI, CLI, or code)
+            Variable.set("users_cdc_last_value", "2024-01-01T00:00:00+00:00")
+
+            # Use the trigger
+            trigger = PostgresCDCEventTrigger(
+                conn_id="my_postgres",
+                table="users",
+                cdc_column="updated_at",
+                polling_interval=30.0
+            )
+
+            # In your DAG task that processes the changes:
+            @task
+            def process_changes():
+                # Get the last processed timestamp
+                last_value = Variable.get("users_cdc_last_value")
+
+                # Process new data since last_value
+                # ... your processing logic here ...
+
+                # IMPORTANT: Update the Variable with the new timestamp
+                # to prevent reprocessing the same data
+                Variable.set("users_cdc_last_value", "2024-01-15T10:30:00+00:00")
 
     :param conn_id: Airflow connection ID for PostgreSQL.
     :param table: Name of the table to monitor.
@@ -89,6 +126,20 @@ class PostgresCDCEventTrigger(BaseEventTrigger):
     async def run(self) -> AsyncGenerator[TriggerEvent, None]:
         hook = PostgresHook(postgres_conn_id=self.conn_id)
 
+        # Check if state Variable exists to prevent recursive DAG executions
+        last_value = self.get_state()
+        if last_value is None:
+            self.log.warning(
+                "State Variable '%s' not found. Please create this Variable (via UI, CLI, or code) "
+                "and ensure your DAG updates it after processing changes to prevent reprocessing the same data. "
+                "Example: Variable.set('%s', '2024-01-01T00:00:00+00:00'). Skipping event emission.",
+                self.state_key, self.state_key
+            )
+            # Wait for the polling interval and continue polling
+            self.log.info("Sleeping for %s seconds", self.polling_interval)
+            await asyncio.sleep(self.polling_interval)
+            return
+
         while True:
             try:
                 with hook.get_conn() as pg_conn:
@@ -106,16 +157,25 @@ class PostgresCDCEventTrigger(BaseEventTrigger):
 
                         max_iso = max_value.isoformat()
 
+                        # Re-fetch state in case it was updated during polling
                         last_value = self.get_state()
                         if last_value:
                             last_dt = datetime.fromisoformat(last_value)
                             if last_dt.tzinfo is None:
                                 last_dt = last_dt.replace(tzinfo=timezone.utc)
                         else:
-                            last_dt = datetime(1970, 1, 1, tzinfo=max_value.tzinfo)
+                            # This should not happen since we checked above, but handle gracefully
+                            self.log.warning("State Variable '%s' was removed during polling. Skipping event emission.", self.state_key)
+                            await asyncio.sleep(self.polling_interval)
+                            return
 
                         if max_value > last_dt:
                             self.log.info("New change detected: %s (iso: %s)", max_value, max_iso)
+                            self.log.info(
+                                "IMPORTANT: After processing changes in your DAG, remember to update "
+                                "Variable '%s' with the new timestamp to prevent reprocessing the same data.",
+                                self.state_key
+                            )
                             yield TriggerEvent(
                                 {"message": f"New change detected at {max_value}", "max_iso": max_iso}
                             )
