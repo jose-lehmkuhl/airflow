@@ -62,11 +62,9 @@ class PostgresCDCEventTrigger(BaseEventTrigger):
 
             # Use the trigger
             trigger = PostgresCDCEventTrigger(
-                conn_id="my_postgres",
-                table="users",
-                cdc_column="updated_at",
-                polling_interval=30.0
+                conn_id="my_postgres", table="users", cdc_column="updated_at", polling_interval=30.0
             )
+
 
             # In your DAG task that processes the changes:
             @task
@@ -133,7 +131,8 @@ class PostgresCDCEventTrigger(BaseEventTrigger):
                 "State Variable '%s' not found. Please create this Variable (via UI, CLI, or code) "
                 "and ensure your DAG updates it after processing changes to prevent reprocessing the same data. "
                 "Example: Variable.set('%s', '2024-01-01T00:00:00+00:00'). Skipping event emission.",
-                self.state_key, self.state_key
+                self.state_key,
+                self.state_key,
             )
             # Wait for the polling interval and continue polling
             self.log.info("Sleeping for %s seconds", self.polling_interval)
@@ -165,7 +164,10 @@ class PostgresCDCEventTrigger(BaseEventTrigger):
                                 last_dt = last_dt.replace(tzinfo=timezone.utc)
                         else:
                             # This should not happen since we checked above, but handle gracefully
-                            self.log.warning("State Variable '%s' was removed during polling. Skipping event emission.", self.state_key)
+                            self.log.warning(
+                                "State Variable '%s' was removed during polling. Skipping event emission.",
+                                self.state_key,
+                            )
                             await asyncio.sleep(self.polling_interval)
                             return
 
@@ -174,7 +176,7 @@ class PostgresCDCEventTrigger(BaseEventTrigger):
                             self.log.info(
                                 "IMPORTANT: After processing changes in your DAG, remember to update "
                                 "Variable '%s' with the new timestamp to prevent reprocessing the same data.",
-                                self.state_key
+                                self.state_key,
                             )
                             yield TriggerEvent(
                                 {"message": f"New change detected at {max_value}", "max_iso": max_iso}

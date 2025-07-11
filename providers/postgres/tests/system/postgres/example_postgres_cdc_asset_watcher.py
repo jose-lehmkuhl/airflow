@@ -108,7 +108,9 @@ with DAG(
                     last_dt = datetime.fromisoformat(last_value)
                 else:
                     # This should not happen if initialize_cdc_state ran properly
-                    raise ValueError(f"CDC state Variable {STATE_KEY} not found. Please run initialize_cdc_state task first.")
+                    raise ValueError(
+                        f"CDC state Variable {STATE_KEY} not found. Please run initialize_cdc_state task first."
+                    )
 
                 query = "SELECT updated_at, id, data FROM my_table WHERE updated_at > %s"
                 cursor.execute(query, (last_dt,))
